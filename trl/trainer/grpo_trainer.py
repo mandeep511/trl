@@ -397,123 +397,184 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
-            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        max_retries = self.args.max_retries_per_question
+        min_reward = self.args.min_reward_threshold
+        
+        best_outputs = None
+        best_reward = float('-inf')
+        retry_count = 0
+        
+        while True:
+            # Generate and evaluate responses
+            prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+            prompt_inputs = self.processing_class(
+                prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+            )
+            prompt_inputs = super()._prepare_inputs(prompt_inputs)
+            prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+            if self.max_prompt_length is not None:
+                prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+                prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
-        # --- Begin retry mechanism ---
-        # Set the number of allowed attempts. If max_retries_per_question is not set, default to 1 try.
-        max_retries = self.args.max_retries_per_question or 1
-        retries = 0
-        best_attempt = None  # to hold the latest attempt's outputs
-
-        while retries < max_retries:
-            # Generate completions (the same as in the original code)
+            # Generate completions using either vLLM or regular generation
             if self.args.use_vllm:
-                # [vLLM generation branch; unchanged from original]
-                # ...
-                pass
+                # First, have main process load weights if needed
+                if self.state.global_step != self._last_loaded_step:
+                    with unwrap_model_for_generation(
+                        self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                    ) as unwrapped_model:
+                        if is_compiled_module(unwrapped_model):
+                            state_dict = unwrapped_model._orig_mod.state_dict()
+                        else:
+                            state_dict = unwrapped_model.state_dict()
+                    if self.accelerator.is_main_process:
+                        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                        llm_model.load_weights(state_dict.items())
+                    self._last_loaded_step = self.state.global_step
+
+                # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+                all_prompts_text = gather_object(prompts_text)
+                if self.accelerator.is_main_process:
+                    outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                else:
+                    completion_ids = [None] * len(all_prompts_text) * self.num_generations
+
+                # Broadcast the completions from the main process to all processes, ensuring each process receives its
+                # corresponding slice.
+                completion_ids = broadcast_object_list(completion_ids, from_process=0)
+                process_slice = slice(
+                    self.accelerator.process_index * len(prompts) * self.num_generations,
+                    (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
+                )
+                completion_ids = completion_ids[process_slice]
+
+                # Pad the completions, and concatenate them with the prompts
+                completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+                completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+                prompt_ids = torch.repeat_interleave(prompt_ids, self.num_generations, dim=0)
+                prompt_mask = torch.repeat_interleave(prompt_mask, self.num_generations, dim=0)
+                prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             else:
+                # Regular generation path
                 with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                     prompt_completion_ids = unwrapped_model.generate(
                         prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                     )
-                prompt_length = prompt_ids.size(1)
-                # Separate the prompt and completion tokens.
-                prompt_ids_batch = prompt_completion_ids[:, :prompt_length]
-                completion_ids = prompt_completion_ids[:, prompt_length:]
-            
-            # (Optional:) Repeat the prompt mask for each generation if needed.
-            prompt_mask_batch = prompt_mask.repeat_interleave(self.num_generations, dim=0)
 
-            # --- Post-generation processing ---
-            # Mask completion tokens after the first EOS (as in original logic)
+                # Compute prompt length and extract completion ids
+                prompt_length = prompt_ids.size(1)
+                prompt_ids = prompt_completion_ids[:, :prompt_length]
+                completion_ids = prompt_completion_ids[:, prompt_length:]
+                prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+
+            # Mask everything after the first EOS token
             is_eos = completion_ids == self.processing_class.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-            # Compute rewards exactly as before:
-            # (Note: this block computes rewards_per_func and then sums over reward functions)
-            rewards_per_func = torch.zeros(len(prompts) * self.num_generations, len(self.reward_funcs), device=device)
+            # Concatenate prompt_mask with completion_mask for logit computation
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
+
+            logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+
+            with torch.inference_mode():
+                if self.ref_model is not None:
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        ref_per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                        )
+
+            # Decode the generated completions
+            completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            if is_conversational(inputs[0]):
+                completions = [[{"role": "assistant", "content": completion}] for completion in completions]
+
+            # Compute the rewards
+            prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]  # repeat prompts
+
+            rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
             for i, (reward_func, reward_processing_class) in enumerate(
                 zip(self.reward_funcs, self.reward_processing_classes)
             ):
-                if isinstance(reward_func, nn.Module):
+                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                     if is_conversational(inputs[0]):
-                        messages = [{"messages": p + c} for p, c in zip(prompts, self.processing_class.batch_decode(completion_ids, skip_special_tokens=True))]
+                        messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     else:
-                        texts = [p + c for p, c in zip(prompts, self.processing_class.batch_decode(completion_ids, skip_special_tokens=True))]
+                        texts = [p + c for p, c in zip(prompts, completions)]
                     reward_inputs = reward_processing_class(
                         texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
-                    # Custom callable reward function branch.
+                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                     reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
                     for key in reward_kwargs:
                         for example in inputs:
+                            # Repeat each value in the column for `num_generations` times
                             reward_kwargs[key].extend([example[key]] * self.num_generations)
-                    output_reward_func = reward_func(prompts=[p for p in prompts for _ in range(self.num_generations)],
-                                                       completions=self.processing_class.batch_decode(completion_ids, skip_special_tokens=True),
-                                                       **reward_kwargs)
+                    output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-            rewards = rewards_per_func.sum(dim=1)  # Sum rewards from all functions.
-            # Reshape rewards to have one group per question.
-            rewards_grouped = rewards.view(-1, self.num_generations)
-            max_rewards, _ = rewards_grouped.max(dim=1)
-            # For simplicity assume batch size = 1; otherwise, you may want to check each sample.
-            current_max_reward = max_rewards.item() if max_rewards.numel() > 0 else float("-inf")
+            # Sum the rewards from all reward functions
+            rewards = rewards_per_func.sum(dim=1)
 
-            # Compute grouped statistics and advantages (same as original logic)
-            mean_grouped_rewards = rewards_grouped.mean(dim=1)
-            std_grouped_rewards = rewards_grouped.std(dim=1)
-            mean_grouped_rewards_expanded = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-            std_grouped_rewards_expanded = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-            advantages = (rewards - mean_grouped_rewards_expanded) / (std_grouped_rewards_expanded + 1e-4)
+            # Compute grouped-wise rewards
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
 
-            # (Optionally log the attempt's reward)
-            self._log(f"Attempt {retries + 1}: max reward = {current_max_reward}")
+            # Normalize the rewards to compute the advantages
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-            # Save current attempt outputs.
-            best_attempt = {
-                "prompt_ids": prompt_ids,  # original prompt_ids
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                # We assume ref_per_token_logps is computed as in the original code:
-                "ref_per_token_logps": self._get_per_token_logps(
-                    self.ref_model if self.ref_model is not None else self.model,
-                    torch.cat([prompt_ids, completion_ids], dim=1),
-                    torch.cat([prompt_mask, completion_mask], dim=1),
-                    completion_ids.size(1),
-                ),
-                "advantages": advantages,
-            }
+            # Log the metrics
+            reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    reward_func_name = reward_func.__name__
+                self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
-            # If a generated group contains at least one response with high reward, stop retrying.
-            if self.args.min_reward_threshold is not None and current_max_reward >= self.args.min_reward_threshold:
-                break
-            else:
-                retries += 1
-                if retries < max_retries:
-                    self._log(f"Retrying question due to low reward ({current_max_reward} < threshold {self.args.min_reward_threshold}).")
+            self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
+            self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
-        # --- End retry mechanism ---
-
-        return best_attempt
+            # Check if we've met the reward threshold
+            current_max_reward = rewards.max().item()
+            if current_max_reward > best_reward:
+                best_reward = current_max_reward
+                best_outputs = {
+                    "prompt_ids": prompt_ids,
+                    "prompt_mask": prompt_mask,
+                    "completion_ids": completion_ids,
+                    "completion_mask": completion_mask,
+                    "ref_per_token_logps": ref_per_token_logps,
+                    "advantages": advantages,
+                }
+            
+            # Decide whether to continue retrying
+            if min_reward is not None and best_reward >= min_reward:
+                break  # Found satisfactory answer
+            
+            retry_count += 1
+            if max_retries is None or max_retries == 0 or retry_count >= max_retries:
+                break  # Out of retries
+                
+            # Log retry metrics
+            self._metrics["retries"].append(retry_count)
+            
+        return best_outputs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -556,8 +617,13 @@ class GRPOTrainer(Trainer):
         return loss, None, None
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
-
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}
+        
+        # Add retry-specific metrics if available
+        if "retries" in self._metrics:
+            metrics["avg_retries"] = sum(self._metrics["retries"]) / len(self._metrics["retries"])
+            metrics["max_retries"] = max(self._metrics["retries"])
+        
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if next(iter(logs.keys())).startswith("eval_"):

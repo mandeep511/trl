@@ -103,15 +103,20 @@ class GRPOConfig(TrainingArguments):
             τ parameter from the [TR-DPO](https://huggingface.co/papers/2404.09656) paper, which determines how
             frequently the current policy is synchronized with the reference policy. To use this parameter, you must
             set `sync_ref_model=True`.
-
-        > Parameters for the retry mechanism
-
-        max_retries_per_question (`int`, *optional*, defaults to `1`):
-            Maximum number of retry attempts per question. If > 1, will keep generating responses for the same question
-            until either a high reward is achieved or max retries is reached.
-        min_reward_threshold (`float`, *optional*, defaults to `None`):
-            Minimum reward threshold to consider a response satisfactory. If None, will always use max_retries_per_question
-            attempts. If set, will move to next question early if threshold is reached.
+        max_retries_per_question: Optional[int] = field(
+            default=None,
+            metadata={
+                "help": "Maximum number of retry attempts per question before moving to the next one. If None or 0, "
+                "the trainer will move to the next question after one attempt regardless of the reward."
+            },
+        )
+        min_reward_threshold: Optional[float] = field(
+            default=None,
+            metadata={
+                "help": "Minimum reward threshold that needs to be achieved to consider a question answered correctly "
+                "and move to the next one. If None, the trainer will move to the next question after one attempt."
+            },
+        )
     """
 
     # Parameters that control the model and reference model
@@ -254,20 +259,17 @@ class GRPOConfig(TrainingArguments):
             "synchronized with the reference policy. To use this parameter, you must set `sync_ref_model=True`."
         },
     )
-
-    # Parameters for the retry mechanism
     max_retries_per_question: Optional[int] = field(
-        default=1,
+        default=None,
         metadata={
-            "help": "Maximum number of retry attempts per question. If > 1, will keep generating responses "
-            "for the same question until either a high reward is achieved or max retries is reached."
+            "help": "Maximum number of retry attempts per question before moving to the next one. If None or 0, "
+            "the trainer will move to the next question after one attempt regardless of the reward."
         },
     )
     min_reward_threshold: Optional[float] = field(
         default=None,
         metadata={
-            "help": "Minimum reward threshold to consider a response satisfactory. If None, will always "
-            "use max_retries_per_question attempts. If set, will move to next question early if "
-            "threshold is reached."
+            "help": "Minimum reward threshold that needs to be achieved to consider a question answered correctly "
+            "and move to the next one. If None, the trainer will move to the next question after one attempt."
         },
     )
